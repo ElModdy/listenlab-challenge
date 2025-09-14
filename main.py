@@ -27,7 +27,7 @@ attr_to_index_array = [
 ]
 
 # ----------------- Optimizer -----------------
-def optimize_policy_slsqp_grid(N, constraints, mu, quiet=True, n_init=10, ftol=1e-6):
+def optimize_policy_slsqp_grid(N, constraints, mu, quiet=True, n_init=3, ftol=1e-6):
     states = list(mu.keys())
     n_states = len(states)
     n_attrs = len(states[0])
