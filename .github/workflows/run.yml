@@ -2,7 +2,7 @@ name: Run Berghain Script (10x every 15 min)
 
 on:
   schedule:
-    - cron: "*/16 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
