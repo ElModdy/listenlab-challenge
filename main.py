@@ -5,15 +5,13 @@ import time
 import sys
 import random
 import backoff
-from scipy.optimize import minimize
 import os
+from policy import optimize_acceptance_policy
 
-CLIENT_ID = os.getenv("CLIENT_ID")       # GitHub secret for client ID
+CLIENT_ID = os.getenv("CLIENT_ID")
 
-# ----------------- Global State -----------------
 BEST_REJECTED = [790, 3314, 4317]
 
-# Scenario data
 mu_array = [
     {(0, 0): np.float64(0.499), (0, 1): np.float64(0.17850000000000002), (1, 0): np.float64(0.1785), (1, 1): np.float64(0.14400000000000002)},
     {(0, 0, 0, 0): np.float64(0.03425090875645645), (0, 0, 0, 1): np.float64(0.04712353132226759), (0, 0, 1, 0): np.float64(0.0014340346430559681), (0, 0, 1, 1): np.float64(0.0017665252782197165), (0, 1, 0, 0): np.float64(0.030651434603756727), (0, 1, 0, 1): np.float64(0.24927812531751903), (0, 1, 1, 0): np.float64(0.003433621996730672), (0, 1, 1, 1): np.float64(0.005561818081993641), (1, 0, 0, 0): np.float64(0.4193666991917123), (1, 0, 0, 1): np.float64(0.013378360729563535), (1, 0, 1, 0): np.float64(0.003848357408775115), (1, 0, 1, 1): np.float64(0.008831582669949203), (1, 1, 0, 0): np.float64(0.09733195744807445), (1, 1, 0, 1): np.float64(0.04634898263064985), (1, 1, 1, 0): np.float64(0.011682985951438242), (1, 1, 1, 1): np.float64(0.02571107396983744)},
@@ -26,86 +24,43 @@ attr_to_index_array = [
     {'underground_veteran': 0, 'international': 1, 'fashion_forward': 2, 'queer_friendly': 3, 'vinyl_collector': 4, 'german_speaker': 5}
 ]
 
-# ----------------- Optimizer -----------------
-def optimize_policy_slsqp_grid(N, constraints, mu, quiet=True, n_init=3, ftol=1e-6):
-    states = list(mu.keys())
-    n_states = len(states)
-    n_attrs = len(states[0])
-    mu_arr = np.array([mu[s] for s in states], dtype=np.float64)
-    all_ones = tuple([1] * n_attrs)
-    if all_ones not in mu:
-        raise ValueError("mu does not contain the all-ones state")
-    opt_states = [s for s in states if s != all_ones]
-    n_opt = len(opt_states)
-    opt_indices = [states.index(s) for s in opt_states]
-    all_ones_idx = states.index(all_ones)
-    mask = np.array([[s[i] for i in range(n_attrs)] for s in states], dtype=np.float64)
+def constraints_to_counts(constraint_items, attribute_index_map):
+    """Transform constraint JSON list to numpy array of remaining required counts.
 
-    def objective(x):
-        policy_vec = np.zeros(n_states, dtype=np.float64)
-        policy_vec[opt_indices] = x
-        policy_vec[all_ones_idx] = 1.0
-        Z = np.sum(mu_arr * policy_vec)
-        return -Z
+    constraint_items : list[dict] entries contain 'attribute' and 'minCount'.
+    attribute_index_map : dict[str,int] maps attribute name to column index.
+    """
+    counts = np.zeros(len(attribute_index_map), dtype=int)
+    for item in constraint_items:
+        name = item.get("attribute")
+        if name in attribute_index_map:
+            counts[attribute_index_map[name]] = item.get("minCount", 0)
+    return counts
 
-    cons_list = []
-    for i, c in enumerate(constraints):
-        if c <= 0:
-            continue
-        def make_cfun(i=i, c=c):
-            def cfun(x):
-                policy_vec = np.zeros(n_states, dtype=np.float64)
-                policy_vec[opt_indices] = x
-                policy_vec[all_ones_idx] = 1.0
-                Z = np.sum(mu_arr * policy_vec)
-                if Z < 1e-10:
-                    return -c
-                expected = np.sum(mask[:, i] * mu_arr * policy_vec / Z * N)
-                return expected - c
-            return cfun
-        cons_list.append({"type": "ineq", "fun": make_cfun()})
+def person_to_state(person_obj, attribute_index_map):
+    """Convert API person payload into (index, state_tuple, raw_attributes).
 
-    bounds = [(0.0, 1.0)] * n_opt
-    best = None
-    best_val = float("inf")
-    for i in range(n_init):
-        x0 = np.full(n_opt, 1) if i == 0 else np.random.rand(n_opt)
-        res = minimize(
-            objective, x0, method="SLSQP",
-            bounds=bounds, constraints=cons_list,
-            options={"ftol": ftol, "disp": False, "maxiter": 500}
-        )
-        if res.success and res.fun < best_val:
-            best_val = res.fun
-            best = res.x
-    if best is None:
-        return {"policy": {s: 0.0 for s in mu}, "Z": 0.0, "success": False}
-    policy = {s: best[i] for i, s in enumerate(opt_states)}
-    policy[all_ones] = 1.0
-    Z = float(np.sum(mu_arr * np.array([policy[s] for s in states], dtype=np.float64)))
-    return {"policy": policy, "Z": Z, "success": True}
-
-# ----------------- Helpers -----------------
-def parse_constraints(constraints, attr_to_index):
-    result = np.zeros(len(attr_to_index), dtype=int)
-    for c in constraints:
-        attr = c["attribute"]
-        if attr in attr_to_index:
-            result[attr_to_index[attr]] = c["minCount"]
-    return result
-
-def parse_next_person(person, attr_to_index):
-    idx = person["personIndex"]
-    attrs = person["attributes"]
-    n = len(attr_to_index)
-    key = [0]*n
-    for attr,i in attr_to_index.items():
-        key[i] = int(attrs.get(attr,0))
-    return idx, tuple(key), attrs
+    person_obj : dict with personIndex, attributes.
+    attribute_index_map : dict[str,int].
+    """
+    person_index = person_obj["personIndex"]
+    attributes = person_obj["attributes"]
+    key = [0] * len(attribute_index_map)
+    for attr, j in attribute_index_map.items():
+        key[j] = int(attributes.get(attr, 0))
+    return person_index, tuple(key), attributes
 
 # ----------------- Client -----------------
 class GameClient:
+    """Encapsulates API access and game execution for a single scenario."""
+
     def __init__(self, api_base, player_id, scenario):
+        """Create client.
+
+        api_base : str base URL
+        player_id : str identifier
+        scenario : int scenario number (1..n)
+        """
         self.api_base = api_base
         self.player_id = player_id
         self.scenario = scenario
@@ -117,10 +72,11 @@ class GameClient:
                 "Accept": "application/json, text/plain, */*",
                 "Accept-Language": "en-US,en;q=0.9",
             },
-            http2=False
+            http2=False,
         )
 
     def close(self):
+        """Close underlying HTTP client."""
         self.client.close()
 
     @backoff.on_exception(
@@ -135,10 +91,11 @@ class GameClient:
         predicate=lambda r: r is not None and r.status_code >= 500
     )
     def _get(self, url):
-        resp = self.client.get(url)
-        return resp
+        """Issue GET request (retry backoff applied by decorators)."""
+        return self.client.get(url)
 
     def new_game(self):
+        """Start a new game session and return its JSON payload."""
         url = f"{self.api_base}/new-game?scenario={self.scenario}&playerId={self.player_id}"
         attempts = 0
         while attempts < 200:
@@ -152,6 +109,7 @@ class GameClient:
         raise RuntimeError("Failed to start game after 200 retries (HTTP 429)")
 
     def decide(self, game_id, person_index, accept=None):
+        """Submit decision for a person and return next state JSON."""
         url = f"{self.api_base}/decide-and-next?gameId={game_id}&personIndex={person_index}"
         if accept is not None:
             url += f"&accept={'true' if accept else 'false'}"
@@ -160,61 +118,62 @@ class GameClient:
         return resp.json()
 
     def play(self):
-        mu = mu_array[self.scenario-1]
-        attr_to_index = attr_to_index_array[self.scenario-1]
+        """Run the main game loop until win, abort, or quota exhaustion.
 
-        game = self.new_game()
-        game_id = game["gameId"]
-        constraints = parse_constraints(game["constraints"], attr_to_index)
-        N_remain = 1000
-        rejected = 0
+        Returns dict with success (bool), rejected (int), aborted (bool).
+        """
+        state_distribution = mu_array[self.scenario - 1]
+        attribute_index_map = attr_to_index_array[self.scenario - 1]
+        game_payload = self.new_game()
+        game_id = game_payload["gameId"]
+        remaining_required_counts = constraints_to_counts(game_payload["constraints"], attribute_index_map)
+        remaining_acceptances = 1000
+        rejected_count = 0
         state = self.decide(game_id, 0)
-
-        policy = None
-        accepted_since_recompute = False
+        policy_cache = None
+        recompute_needed = False
         aborted = False
-
-        while state["status"] == "running" and N_remain > 0:
-            idx, key, attrs = parse_next_person(state["nextPerson"], attr_to_index)
-            if policy is None or accepted_since_recompute:
-                result = optimize_policy_slsqp_grid(N_remain, constraints, mu, quiet=True)
-                policy = result['policy']
-                accepted_since_recompute = False
-            accept = np.random.rand() < policy.get(key,0)
+        while state.get("status") == "running" and remaining_acceptances > 0:
+            person_index, state_key, _ = person_to_state(state["nextPerson"], attribute_index_map)
+            if policy_cache is None or recompute_needed:
+                policy_cache = optimize_acceptance_policy(
+                    remaining_acceptances,
+                    remaining_required_counts,
+                    state_distribution,
+                )["policy"]
+                recompute_needed = False
+            accept = np.random.rand() < policy_cache.get(state_key, 0)
             if accept:
-                accepted_since_recompute = True
-                N_remain -= 1
-                for i, val in enumerate(key):
-                    if val==1:
-                        constraints[i]-=1
+                recompute_needed = True
+                remaining_acceptances -= 1
+                for i, bit in enumerate(state_key):
+                    if bit == 1:
+                        remaining_required_counts[i] -= 1
             else:
-                rejected += 1
-                if rejected > BEST_REJECTED[self.scenario-1]:
+                rejected_count += 1
+                if rejected_count > BEST_REJECTED[self.scenario - 1]:
                     aborted = True
                     break
-            state = self.decide(game_id, idx, accept)
+            state = self.decide(game_id, person_index, accept)
+        if not aborted and rejected_count < BEST_REJECTED[self.scenario - 1]:
+            BEST_REJECTED[self.scenario - 1] = rejected_count
+        return {
+            "success": state.get("status") == "won" if not aborted else False,
+            "rejected": rejected_count,
+            "aborted": aborted,
+        }
 
-        if not aborted and rejected < BEST_REJECTED[self.scenario-1]:
-            BEST_REJECTED[self.scenario-1] = rejected
-
-        return {"success": state.get("status")=="won" if not aborted else False, "rejected": rejected, "aborted": aborted}
-
-# ----------------- Runner -----------------
 def main():
-    scenario = int(sys.argv[1]) if len(sys.argv)>1 else 1
-    time.sleep(random.random()*1.0)
-    client = GameClient(
-        "https://berghain.challenges.listenlabs.ai",
-        CLIENT_ID,
-        scenario
-    )
-
+    """CLI entry: run one game for the requested scenario."""
+    scenario = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    time.sleep(random.random() * 1.0)
+    client = GameClient("https://berghain.challenges.listenlabs.ai", CLIENT_ID, scenario)
     try:
         result = client.play()
-        print(f"🎮 Game finished: {result}")
+        print(f"Game: {result}")
     finally:
         client.close()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
 
